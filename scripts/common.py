@@ -7,21 +7,64 @@
   - pymilvus 当前版本 3.0.2，search() 的参数名是 `search_params`（不是旧版的 `param`）
   - BM25 Function / 中文 analyzer 需要 Milvus server >= 2.5，Lite 也不支持
 
+【重大 API 差异 —— 必看】
+  hybrid_search() **没有顶层 filter 参数**（签名只有 collection_name/reqs/
+  ranker/limit/output_fields/timeout/partition_names）。
+  传 filter=... 会进 **kwargs 被静默丢弃 → 过滤完全不生效！
+  正确做法：把 expr（或 filter）写进每个 AnnSearchRequest。
+
+【Embedding 接入】
+  模型：BAAI/bge-m3（硅基流动，免费，1024 维，中英文能力强）
+  接口：OpenAI 兼容  https://api.siliconflow.cn/v1/embeddings
+  key ：从环境变量 SILICONFLOW_API_KEY 读取，不硬编码
+
 用法：所有脚本从本模块 import，改 MILVUS_URI 即可切换环境
 """
 
 import os
+import json
+import hashlib
+import urllib.request
+import urllib.error
+from pathlib import Path
+
 import numpy as np
 
 # ---------------------------------------------------------------
-# 连接配置：默认连 Docker 起的 standalone
-# 如果你以后部署到服务器，只改这一行
+# 加载 .env（放在 learning/milvus/ 下）
+# 优先级：真实环境变量 > .env 文件
+# 这样你既能用 .env 存 key，也能用临时环境变量覆盖
+# ---------------------------------------------------------------
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+        if _k and _k not in os.environ:
+            os.environ[_k] = _v
+
+# ---------------------------------------------------------------
+# 连接配置
 # ---------------------------------------------------------------
 MILVUS_URI = os.getenv("MILVUS_URI", "http://localhost:19530")
 COLLECTION = "llm_wiki_chunks"
-DIM = 1536          # DashScope text-embedding-v2 维度
 
-# 返回结构的字段列表，统一提出来避免各脚本写不一致
+# ---------------------------------------------------------------
+# Embedding 配置
+# ---------------------------------------------------------------
+EMBED_MODEL = "BAAI/bge-m3"
+EMBED_URL = "https://api.siliconflow.cn/v1/embeddings"
+EMBED_DIM = 1024            # bge-m3 输出维度
+
+# DIM 是 collection schema 用的维度，必须和 embedding 模型一致
+DIM = EMBED_DIM
+
+# 本地缓存目录：避免重复调用 API（省钱 + 提速）
+CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "embed_cache"
+
 OUTPUT_FIELDS = ["doc_id", "dimension", "chunk_offset", "content", "title"]
 
 
@@ -30,31 +73,129 @@ def get_client():
     return MilvusClient(uri=MILVUS_URI)
 
 
-def fake_embed(text: str, doc_id: str = "query") -> list:
+def _get_api_key() -> str:
+    key = os.getenv("SILICONFLOW_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "未设置 SILICONFLOW_API_KEY 环境变量。\n"
+            "  Windows PowerShell:  $env:SILICONFLOW_API_KEY='sk-xxx'\n"
+            "  Windows CMD:         set SILICONFLOW_API_KEY=sk-xxx\n"
+            "  或永久写入项目 .env 后由脚本加载"
+        )
+    return key
+
+
+# ---------------------------------------------------------------
+# Embedding：真实模型 + 本地缓存
+# ---------------------------------------------------------------
+def _cache_path(text: str) -> Path:
+    h = hashlib.sha256(f"{EMBED_MODEL}::{text}".encode("utf-8")).hexdigest()[:32]
+    return CACHE_DIR / f"{h}.json"
+
+
+def embed(text: str) -> list:
     """
-    【仅学习用】确定性伪向量生成器
+    单条文本 -> 1024 维向量（带本地缓存）
 
-    真实项目替换为：
-        import dashscope
-        resp = dashscope.TextEmbedding.call(
-            model="text-embedding-v2", input=text)
-        return resp.output["embeddings"][0]["embedding"]
-
-    为什么用伪向量：让你在**没有 API key、没有网络**的情况下也能跑通全部流程，
-    把注意力放在 Milvus 的行为上，而不是被 embedding 服务卡住。
-
-    构造逻辑：同 doc_id 的向量共享一个基向量（模拟"同文档语义相关"），
-    再叠加与文本内容相关的扰动。这样 Dense 检索会表现出"同文档优先"的倾向，
-    足以观察 hybrid 融合行为。
+    为什么加缓存：
+      - 建 collection / 反复调试时同一条文本会被算很多次
+      - 免费额度虽然够用，但没必要浪费，也省网络延迟
     """
-    rng = np.random.default_rng(abs(hash(doc_id)) % (2**32))
-    base = rng.normal(0, 1, DIM)
-    rng2 = np.random.default_rng(abs(hash(text)) % (2**32))
-    v = base + rng2.normal(0, 0.3, DIM)
-    return (v / np.linalg.norm(v)).tolist()
+    cp = _cache_path(text)
+    if cp.exists():
+        try:
+            return json.loads(cp.read_text(encoding="utf-8"))
+        except Exception:
+            pass  # 缓存损坏则重算
+
+    vec = embed_batch([text])[0]
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cp.write_text(json.dumps(vec), encoding="utf-8")
+    return vec
 
 
+def embed_batch(texts: list[str]) -> list[list[float]]:
+    """
+    批量文本 -> 向量列表（不查缓存，直接调 API）
+
+    硅基流动单次请求最多 1024 条，超出会自动分批。
+    """
+    if not texts:
+        return []
+
+    api_key = _get_api_key()
+    out: list[list[float]] = []
+    BATCH = 64      # 保守批量，避免单请求过大
+
+    for i in range(0, len(texts), BATCH):
+        chunk = texts[i:i + BATCH]
+        payload = json.dumps({
+            "model": EMBED_MODEL,
+            "input": chunk,
+            "encoding_format": "float",
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            EMBED_URL,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"embedding API HTTPError {e.code}: {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"embedding API 网络失败: {e}") from e
+
+        # OpenAI 兼容格式：{"data": [{"embedding": [...], "index": 0}, ...]}
+        data = sorted(body["data"], key=lambda d: d.get("index", 0))
+        out.extend(d["embedding"] for d in data)
+
+    got = len(out)
+    if got != len(texts):
+        raise RuntimeError(f"embedding 返回条数不符：请求 {len(texts)}，返回 {got}")
+    return out
+
+
+def embed_cached_batch(texts: list[str]) -> list[list[float]]:
+    """批量 + 缓存：只对未命中的文本调 API"""
+    results: list[list[float] | None] = [None] * len(texts)
+    miss_idx, miss_texts = [], []
+
+    for i, t in enumerate(texts):
+        cp = _cache_path(t)
+        if cp.exists():
+            try:
+                results[i] = json.loads(cp.read_text(encoding="utf-8"))
+                continue
+            except Exception:
+                pass
+        miss_idx.append(i)
+        miss_texts.append(t)
+
+    if miss_texts:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        vecs = embed_batch(miss_texts)
+        for i, t, v in zip(miss_idx, miss_texts, vecs):
+            results[i] = v
+            _cache_path(t).write_text(json.dumps(v), encoding="utf-8")
+        print(f"[i] embedding: 新增计算 {len(miss_texts)} 条"
+              f"（命中缓存 {len(texts) - len(miss_texts)} 条）")
+    else:
+        print(f"[i] embedding: 全部命中缓存（{len(texts)} 条），未调 API")
+
+    return results  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------
 # 模拟切片数据 —— 四维度 × 三文档，覆盖本项目真实形态
+# ---------------------------------------------------------------
 SAMPLE_DOCS = [
     ("doc_a", "event", 0, "某公司2026年Q1财报",
      "该公司2026年第一季度营业收入达到12.3亿元，同比增长45%，主要由新能源业务驱动。"),
@@ -79,17 +220,40 @@ SAMPLE_DOCS = [
 ]
 
 
-def print_hits(title: str, hits, max_len: int = 38):
-    """统一的结果打印格式"""
+def print_hits(title: str, hits, max_len: int = 38, score_label: str | None = None):
+    """
+    统一的结果打印格式
+
+    score_label 说明：
+      None            -> 自动判断。有 distance 就显示，没有就显示 "(无分数)"
+      "RRF"           -> 标注该分数是 RRF 融合分，无物理意义
+      "BM25" / "COSINE" -> 标注分数的度量类型
+    """
     print(f"\n{'='*76}\n{title}\n{'='*76}")
     if not hits:
         print("  (无结果)")
         return
+
+    has_score = any("distance" in h for h in hits)
+    if not has_score:
+        header = "(纯标量查询，无相似度分数)"
+    elif score_label:
+        header = f"(分数类型: {score_label})"
+    else:
+        header = ""
+    if header:
+        print(f"  {header}")
+
     for i, h in enumerate(hits, 1):
-        e = h.get("entity", h)      # search 返回有 entity 包一层，query 返回没有
-        score = h.get("distance", h.get("score", 0))
+        e = h.get("entity", h)      # search 返回有 entity 包一层，query 返回平铺
         content = str(e.get("content", ""))[:max_len]
-        print(f"  {i}. score={score:.4f} | {e.get('doc_id')} "
+
+        if has_score:
+            score_str = f"score={h.get('distance', 0):>9.4f}"
+        else:
+            score_str = "score=     ---"
+
+        print(f"  {i}. {score_str} | {e.get('doc_id')} "
               f"| {str(e.get('dimension')):<8} | off={e.get('chunk_offset')} "
               f"| {content}...")
 
@@ -99,14 +263,11 @@ def show_collection_info(client, name=COLLECTION):
     desc = client.describe_collection(name)
     print("\n=== Fields ===")
     for f in desc["fields"]:
-        extra = {k: v for k, v in f.items()
-                 if k not in ("name", "type", "description", "params")}
         params = f.get("params", {})
         interesting = {k: v for k, v in params.items()
                        if k in ("enable_analyzer", "analyzer_params", "enable_match", "max_length")}
         print(f"  {f['name']:<16} {f['type']:<22} {interesting if interesting else ''}")
 
-    # pymilvus 3.x 里 analyzer 配置在 params 下，单独打一遍确保能看到
     print("\n=== Analyzer / Match 检查 ===")
     for f in desc["fields"]:
         p = f.get("params", {})

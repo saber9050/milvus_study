@@ -1,0 +1,7 @@
+# 环境变量与缓存，不入版本库
+.env
+__pycache__/
+*.pyc
+data/embed_cache/
+data/*.db
+volumes/

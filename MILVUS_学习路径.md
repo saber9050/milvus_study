@@ -7,7 +7,7 @@
 
 ## 已知报错速查
 
-### `ParamError: Function output field not found in collection schema.: sparse_vector`
+### 1. `ParamError: Function output field not found in collection schema.: sparse_vector`
 
 **原因**：BM25 Function 的 `output_field_names=["sparse_vector"]`，但 schema 里没有定义 `sparse_vector` 字段。
 
@@ -21,7 +21,39 @@ schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)
 
 注意：这个字段**不需要手动赋值**，Milvus 写入时自动算 BM25 填进去，但字段本身必须先占位。
 
-（这个坑我第一版脚本踩了，已修。）
+### 2. ⚠️ `hybrid_search` 的 filter 被静默丢弃（最危险的坑）
+
+**现象**：写了 `filter='dimension == "opinion"'`，结果里却混进了 `event`/`entity` 等不满足条件的记录，**而且不报任何错**。
+
+**原因**：`hybrid_search()` 的签名里**没有 `filter` 参数**：
+
+```
+collection_name / reqs / ranker / limit / output_fields / timeout / partition_names
+```
+
+传 `filter=...` 会进 `**kwargs` 被忽略。
+
+**修复**：过滤条件必须写进**每个** `AnnSearchRequest`：
+
+```python
+AnnSearchRequest(
+    data=[q_vec], anns_field="dense_vector",
+    param={...}, limit=10,
+    expr='dimension == "opinion"',      # ← 这里
+)
+```
+
+注意 `expr` 和 `filter` 二选一，同时传会抛 `ParamError`。
+
+**单路 `search()` 的 `filter=` 是顶层参数，可以正常用。只有 hybrid 不一样。**
+
+**这个坑的危险性在于它不报错。** 防坑手段：拿到结果后，检查返回项是否全部满足过滤条件（step3 脚本里有"自动校验"块专门做这个）。
+
+### 3. `query()` 返回的字段出现 `None`
+
+**原因**：`output_fields` 没写全。`search()` 和 `query()` 都只返回你点名的字段。
+
+**修复**：把需要的字段都列进 `output_fields`。
 
 ---
 
@@ -30,10 +62,32 @@ schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)
 | 项 | 状态 | 说明 |
 |---|---|---|
 | Docker | **未安装** | 必须先用 Docker 起 Milvus standalone |
-| WSL | **被安全策略禁用** | 无法用 WSL 后端跑 Docker Desktop |
+| WSL | **被安全策略禁用**（agent 沙箱内） | 用户本机 WSL 可用，Milvus 已部署成功 |
 | milvus_lite | **不可用** | Windows + Python 3.13 没有预编译 wheel，装不上 |
 | pymilvus | 3.0.2 已装 | 在 `C:\Users\asus\.workbuddy\binaries\python\envs\default` |
-| 结论 | 只能走 Docker | Lite 路线在本机走不通，不用浪费时间试 |
+| **Embedding** | **BAAI/bge-m3（硅基流动，免费，1024 维）** | 已接通，带本地缓存 |
+| 结论 | 走 Docker/WSL 部署 | Lite 路线在本机走不通，不用浪费时间试 |
+
+### Embedding 配置
+
+| 项 | 值 |
+|---|---|
+| 模型 | `BAAI/bge-m3` |
+| 服务 | 硅基流动 https://api.siliconflow.cn |
+| 维度 | **1024**（schema 里的 `DIM` 必须一致） |
+| API 格式 | OpenAI 兼容（`/v1/embeddings`） |
+| Key 存放 | `learning/milvus/.env` 的 `SILICONFLOW_API_KEY`，由 `common.py` 自动加载 |
+| 缓存 | `learning/milvus/data/embed_cache/`，按 sha256 去重，重复文本不重复调 API |
+
+**为什么选 bge-m3 而不是 DashScope：** 免费、无需备案、中英文能力都强、OpenAI 兼容接口好接。
+
+**换 key 的方法：** 改 `.env` 文件，或用临时环境变量覆盖（真实环境变量优先级更高）：
+```bash
+# PowerShell
+$env:SILICONFLOW_API_KEY='sk-xxx'
+# CMD
+set SILICONFLOW_API_KEY=sk-xxx
+```
 
 ### 关键 API 差异（踩坑点）
 
@@ -42,7 +96,6 @@ pymilvus 3.x 与网上老教程不同：
 | 老写法（2.x） | 新写法（3.x） |
 |---|---|
 | `search(..., param={...})` | `search(..., search_params={...})` |
-| `client.search(data=[q], anns_field=...)` 的参数名不变 | 但要留意 `search_params` |
 | `add_index` 的 `metric_type` 是位置参数 | 走 `**kwargs`，写法 `add_index(field_name="x", index_type="HNSW", metric_type="COSINE", params={...})` |
 
 ---
@@ -177,21 +230,36 @@ hits = client.hybrid_search(collection_name=..., reqs=[req_dense, req_bm25],
                             ranker=RRFRanker(60), limit=5, output_fields=[...])
 ```
 
+**★ 过滤条件写法（见上文坑 2，hybrid 特有）**：
+
+```python
+# ❌ 错 —— 被静默丢弃，过滤完全不生效，且不报错
+client.hybrid_search(reqs=[...], ranker=..., filter='dimension == "opinion"')
+
+# ✅ 对 —— 塞进【每个】 AnnSearchRequest
+req_dense = AnnSearchRequest(..., expr='dimension == "opinion"')
+req_bm25  = AnnSearchRequest(..., expr='dimension == "opinion"')
+```
+
+单路 `search()` 的 `filter=` 是顶层参数，能正常用；只有 hybrid 不一样。
+
 ### 该看什么
 
-脚本会输出 7 组结果，重点对比：
+脚本输出 8 组结果，重点对比四类：
 
-1. `RRFRanker(k=60)` vs `k=1` vs `k=1000`
-2. `WeightedRanker(0.7,0.3)` vs `WeightedRanker(0.3,0.7)`
-3. 带 `filter` 的 hybrid 结果
+1. `RRFRanker(k=60)` vs `k=1`（分数跨度 0.625→0.375）vs `k=1000`（全为 0.0020，差异抹平）
+2. `WeightedRanker(0.7,0.3)` vs `WeightedRanker(0.3,0.7)` —— 注意分数**绝对值**，偏关键词那组普遍更高
+3. **★ 过滤生效验证**：脚本末尾有"自动校验"块，直接告你过滤有没有真的生效
+4. **各路候选数 limit**：`2` / `5` / `10` 对最终结果的影响
 
 ### 该得什么结论
 
 | 结论 | 说明 |
 |---|---|
 | **RRF 只看排名，不看分数** | 公式 `Σ 1/(k+rank)`，对 dense/sparse 分数尺度差异免疫 |
-| **k 越小越"独裁"** | k=1 时单路第1名权重 1.0，第2名只有 0.5；k=60 时 1/61≈0.0164 vs 1/62≈0.0161 |
+| **k 越小越"独裁"** | k=1 时单路第1名权重 1.0，第2名只有 0.5；k=60 时 1/61≈0.0164 vs 1/62≈0.0161；k 极大时退化成"谁被更多路命中谁靠前" |
 | **本项目默认用 RRF 不用 Weighted** | dense 是 COSINE(0~1)，BM25 分数是另一套尺度（可到几十），不可比。WeightedRanker 依赖归一化，调不好比 RRF 更差 |
+| **候选数 limit 要 ≥ 最终 top-k 的 2-3 倍** | 候选池太小 → 两路交集少 → 融合没意义。生产常用 50-100（留给 Reranker 重排） |
 | **filter 在向量检索内部执行** | 不是先查后筛。filter 筛掉 99% 数据时，HNSW 图遍历找不到足够候选，召回率骤降 |
 
 ---
@@ -274,25 +342,46 @@ python step4_evaluate.py
 
 ---
 
-## 第 5 步：接真实 embedding（可选，但有价值）
+## 第 5 步：Embedding 质量对检索的影响（已配好，可直接验证）
 
-学习脚本用伪向量让你跳过 API 依赖。跑通全流程后，把 `common.py` 的 `fake_embed()` 换成真实调用：
+**当前已接入真实 embedding（BAAI/bge-m3，硅基流动）。** 用真实模型跑一遍 step2，你会看到正确的语义排序：
 
-```python
-import dashscope
-from dashscope import TextEmbedding
-
-def embed(text: str) -> list:
-    resp = TextEmbedding.call(
-        model="text-embedding-v2",
-        input=text,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"embedding 失败: {resp}")
-    return resp.output["embeddings"][0]["embedding"]
+```
+query = '公司新能源业务增长情况如何'
+  1. +0.7708 | 该公司2026年第一季度营业收入达到12.3亿元，同比增长45%      ← 最相关
+  2. +0.7123 | 管理层在业绩会上表示，新能源板块毛利率提升至28%
+  3. +0.6579 | 国家发改委发布关于促进新能源产业健康发展的指导意见
+  4. +0.6401 | 竞品公司在2026年Q1实现营收8.7亿元，同比下滑12%          ← ★ 注意这条
+  5. +0.6355 | 宁德时代、比亚迪、隆基绿能是该公司新能源业务的主要供应商
+  ...
+ 10. +0.4662 | 该竞品的组织架构调整过于频繁，导致战略执行连续性不足
 ```
 
-**换完之后重跑 step4**，你会看到 Recall/nDCG 发生显著变化 —— 这就是"embedding 质量对检索效果的影响"，也是分层排查里第 3 层要验证的东西。
+**★ 第 4 条是 dense 缺陷的活证据：**
+
+query 问的是"**增长**情况"，而这条讲的是"同比**下滑**12%" —— 语义方向完全相反，但 dense 给了它 0.6401、排到了第 4 名。
+
+为什么？因为它含"营收""同比""新能源业务"这些**共现词**，向量空间里距离被拉近了。**dense 分不清"涨"和"跌"。**
+
+这不是 Milvus 的 bug，是稠密向量检索的固有局限。**补它的正是 BM25** —— 如果 query 里明确带"下滑"，BM25 会精准锁定这条。
+
+### 你要做的对比实验
+
+把 step2 的 query 从 `'公司新能源业务增长情况如何'` 改成：
+
+| 改成的 query | 观察什么 |
+|---|---|
+| `'公司新能源业务下滑情况'` | dense 会不会还把"增长45%"排前面？ |
+| `'价格战风险'` | dense 和 BM25 谁更准？ |
+| `'隆基绿能'` | dense 能精准锁定吗？BM25 能 |
+
+**这就是分层排查里第 3 层"embedding 模型是否适配领域"的验证手段** —— 看到排序违背直觉时，先怀疑向量质量，再怀疑索引参数。
+
+### 换 embedding 模型时要注意
+
+1. **维度必须和 schema 一致** —— 换模型后 dimension 变了，collection 必须重建（step1 重跑）
+2. **清了缓存** —— `data/embed_cache/` 是按模型名 + 文本做 key 的，换模型不会串，但旧向量要重算
+3. **重跑顺序**：step1（重建表）→ step2（重灌数据）→ step3/4
 
 ---
 

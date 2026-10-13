@@ -18,7 +18,7 @@ import time
 import numpy as np
 from pymilvus import AnnSearchRequest, RRFRanker, WeightedRanker
 
-from common import get_client, fake_embed, COLLECTION
+from common import get_client, embed_cached_batch, COLLECTION
 
 client = get_client()
 
@@ -42,31 +42,44 @@ EVAL_SET = [
 
 
 def run_search(query, mode, limit=10, ef=64, rrf_k=60, weight=None, filter_expr=""):
-    """统一检索入口，返回 [(doc_id, chunk_offset), ...] 有序列表"""
-    q_vec = fake_embed(query)
+    """
+    统一检索入口，返回 [(doc_id, chunk_offset), ...] 有序列表
+
+    【坑】hybrid_search() 没有顶层 filter 参数，filter_expr 必须塞进
+         每个 AnnSearchRequest。详见 step3 顶部说明。
+    """
+    q_vec = embed_cached_batch([query])[0]
     out = ["doc_id", "chunk_offset"]
     common = dict(collection_name=COLLECTION, limit=limit, output_fields=out)
-    if filter_expr:
-        common["filter"] = filter_expr
 
     if mode == "dense":
-        hits = client.search(
-            data=[q_vec], anns_field="dense_vector",
-            search_params={"metric_type": "COSINE", "params": {"ef": ef}},
-            **common)[0]
+        kw = dict(data=[q_vec], anns_field="dense_vector",
+                  search_params={"metric_type": "COSINE", "params": {"ef": ef}})
+        if filter_expr:
+            kw["filter"] = filter_expr          # 单路 search 的 filter 是顶层参数，OK
+        hits = client.search(**common, **kw)[0]
+
     elif mode == "bm25":
-        hits = client.search(
-            data=[query], anns_field="sparse_vector",
-            search_params={"metric_type": "BM25"}, **common)[0]
+        kw = dict(data=[query], anns_field="sparse_vector",
+                  search_params={"metric_type": "BM25"})
+        if filter_expr:
+            kw["filter"] = filter_expr
+        hits = client.search(**common, **kw)[0]
+
     else:  # hybrid
-        reqs = [
-            AnnSearchRequest([q_vec], "dense_vector",
-                             {"metric_type": "COSINE", "params": {"ef": ef}}, limit=limit),
-            AnnSearchRequest([query], "sparse_vector",
-                             {"metric_type": "BM25"}, limit=limit),
-        ]
+        # ★ expr 必须写进每个 AnnSearchRequest
+        dense_kw = dict(data=[q_vec], anns_field="dense_vector",
+                        param={"metric_type": "COSINE", "params": {"ef": ef}},
+                        limit=limit)
+        bm25_kw = dict(data=[query], anns_field="sparse_vector",
+                       param={"metric_type": "BM25"}, limit=limit)
+        if filter_expr:
+            dense_kw["expr"] = filter_expr
+            bm25_kw["expr"] = filter_expr
+
+        reqs = [AnnSearchRequest(**dense_kw), AnnSearchRequest(**bm25_kw)]
         ranker = WeightedRanker(*weight) if weight else RRFRanker(rrf_k)
-        hits = client.hybrid_search(reqs=reqs, ranker=ranker, **common)[0]
+        hits = client.hybrid_search(**common, reqs=reqs, ranker=ranker)[0]
 
     return [(h["entity"]["doc_id"], h["entity"]["chunk_offset"]) for h in hits]
 
@@ -164,6 +177,17 @@ for k in [1, 10, 30, 60, 100, 300]:
 print("\n" + "=" * 78)
 print("演练：filter 选择性过高导致召回塌陷（最常被误判成「索引参数问题」）")
 print("=" * 78)
+print("说明：本演练用 hybrid + filter。注意 filter 是塞进 AnnSearchRequest 的 expr，")
+print("      不是 hybrid_search 顶层参数（顶层传会被静默丢弃）。")
+print()
+print(f"{'过滤条件':<18}{'Recall@3':<12}{'nDCG@3':<12}{'说明'}")
+print("-" * 78)
+_notes = {
+    "无过滤": "基线",
+    '只 doc_a': "命中 3 个标注中的部分",
+    '只 opinion 维度': "评测集有多条 opinion 相关项",
+    '只 meta 维度': "评测集里 meta 相关项≈0 → 必然接近 0",
+}
 for label, fexpr in [
     ("无过滤", ""),
     ("只 doc_a", 'doc_id == "doc_a"'),
@@ -171,7 +195,10 @@ for label, fexpr in [
     ("只 meta 维度", 'dimension == "meta"'),
 ]:
     r, n, _ = evaluate("hybrid", K=3, filter_expr=fexpr)
-    print(f"  {label:<16} Recall@3 = {r:.4f}   nDCG@3 = {n:.4f}")
+    print(f"{label:<18}{r:<12.4f}{n:<12.4f}{_notes.get(label, '')}")
+print()
+print("关键：'只 meta 维度' 的 Recall 接近 0，是【评测集与 filter 意图不匹配】，")
+print("      不是检索能力问题。真实调优时先问：这个 filter 和 query 意图匹配吗？")
 
 # =================================================================
 # 7. 逐 query 诊断 —— 定位"到底哪类 query 在拖后腿"
